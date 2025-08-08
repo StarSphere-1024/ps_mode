@@ -492,6 +492,22 @@ void vTaskControl(void *pvParameters) {
           move_speed = map(ly, 0, 255, 255, -255);
         if (abs(lx - 128) > 15)
           strafe_speed = map(lx, 0, 255, -255, 255);
+
+        // 如果模拟摇杆在死区内，则检查D-Pad（方向键）的输入
+        if (move_speed == 0 && strafe_speed == 0) {
+          if (ps2x.Button(PSB_PAD_UP)) {
+            move_speed = dpad_speed;  // 前进
+          } else if (ps2x.Button(PSB_PAD_DOWN)) {
+            move_speed = -dpad_speed;  // 后退
+          }
+
+          if (ps2x.Button(PSB_PAD_LEFT)) {
+            strafe_speed = -dpad_speed;  // 左平移
+          } else if (ps2x.Button(PSB_PAD_RIGHT)) {
+            strafe_speed = dpad_speed;  // 右平移
+          }
+        }
+
         if (ps2x.Button(PSB_L1))
           rotate_speed = 200;
         if (ps2x.Button(PSB_R1))
