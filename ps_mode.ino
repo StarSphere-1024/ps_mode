@@ -39,7 +39,6 @@
 #include "Ultrasonic.h"
 #include <WonderK210.h>
 
-
 // =================================================================================
 // 区域: config.h - 全局配置
 // =================================================================================
@@ -58,9 +57,27 @@
 #define ASR_RX_PIN 35
 #define ASR_TX_PIN 34
 // Grove 接口
-#define GROVE2_PIN_A 7   // 超声波
-#define GROVE5_PIN_A 5   // 温湿度
-#define ANALOG2_PIN_A 1  // 光线
+
+#define GROVE6_PIN_A 1
+#define GROVE6_PIN_B 2
+#define GROVE3_PIN_A 3
+#define GROVE3_PIN_B 4
+#define GROVE5_PIN_A 5
+#define GROVE5_PIN_B 6
+#define GROVE2_PIN_A 7
+#define GROVE2_PIN_B 8
+#define GROVE4_PIN_A 26
+#define GROVE4_PIN_B 38
+
+#define LIGHT_PIN GROVE2_PIN_A
+#define DHT_PIN GROVE4_PIN_A
+#define ULTRASONIC_PIN GROVE5_PIN_A
+
+#define LINE_SENSOR_L2_PIN GROVE3_PIN_A  // 最左
+#define LINE_SENSOR_L1_PIN GROVE3_PIN_B  // 内左
+#define LINE_SENSOR_R1_PIN GROVE6_PIN_A  // 内右
+#define LINE_SENSOR_R2_PIN GROVE6_PIN_B  // 最右
+
 // PS2 手柄
 #define PS2_CMD_PIN 9
 #define PS2_DATA_PIN 10
@@ -91,20 +108,24 @@
 #define SERVO_PWM_PERIOD_MS 20         // 20ms 周期
 #define SERVO_MIN_PULSE_US 500
 #define SERVO_MAX_PULSE_US 2500
-#define SERVO_DEFAULT_ANGLE 90
+#define SERVO1_DEFAULT_ANGLE 100
+#define SERVO2_DEFAULT_ANGLE 90
 
 // -- FreeRTOS 配置 --
 // 任务优先级
+#define TASK_LINE_FOLLOWING_PRIO 3  // 与控制任务同级
+#define TASK_SENSOR_COLLECTION_PRIO 2
 #define TASK_SENSOR_COLLECTION_PRIO 2  // 采集任务
 #define TASK_DATA_REPORTING_PRIO 1     // 上报任务优先级可以低
 #define TASK_CONTROL_PRIO 3
 #define TASK_MOTOR_PRIO 4  // 电机控制任务优先级最高，保证响应及时
 #define TASK_UI_PRIO 2
 // 任务堆栈大小
+#define TASK_LINE_FOLLOWING_STACK_SIZE 4096
 #define TASK_SENSOR_COLLECTION_STACK_SIZE 4096
 #define TASK_DATA_REPORTING_STACK_SIZE 4096
-#define TASK_CONTROL_STACK_SIZE 4096
-#define TASK_MOTOR_STACK_SIZE 2048
+#define TASK_CONTROL_STACK_SIZE 8192
+#define TASK_MOTOR_STACK_SIZE 4096
 #define TASK_UI_STACK_SIZE 4096
 // 队列大小
 #define MOTOR_CMD_QUEUE_LEN 5
@@ -129,8 +150,15 @@
 // 区域: types.h - 共享数据结构和枚举
 // =================================================================================
 
+// typedef enum
+// {
+//   MODE_MANUAL,        // 手动遥控模式
+//   MODE_LINE_FOLLOWING // 自动循迹模式
+// } CarMode;
+
 // 电机控制指令结构体
-typedef struct {
+typedef struct
+{
   int16_t lf_speed;  // 左前
   int16_t rf_speed;  // 右前
   int16_t lr_speed;  // 左后
@@ -138,13 +166,15 @@ typedef struct {
 } MotorCommand;
 
 // 舵机控制指令结构体
-typedef struct {
+typedef struct
+{
   uint8_t servo1_angle;
   uint8_t servo2_angle;
 } ServoCommand;
 
 // 传感器数据包结构体
-typedef struct {
+typedef struct
+{
   float temperature;
   float humidity;
   float acc_x;
@@ -157,7 +187,6 @@ typedef struct {
   bool face_detected;
 } SensorDataPacket;
 
-
 // =================================================================================
 // 区域: 全局变量与对象
 // =================================================================================
@@ -168,15 +197,17 @@ QueueHandle_t g_servo_cmd_queue;
 QueueHandle_t g_sensor_data_queue;
 EventGroupHandle_t g_ui_event_group;
 
+// volatile CarMode g_car_mode = MODE_MANUAL;
 bool g_is_accelerometer_available = false;
+bool g_is_ps2_connected = false;
 BLECharacteristic *pCharacteristic;
 bool g_device_connected = false;
 
 // -- 硬件对象 --
 PS2X ps2x;
 LIS3DHTR<TwoWire> LIS;
-DHT dht(GROVE5_PIN_A, DHT11);
-Ultrasonic ultrasonic(GROVE2_PIN_A);
+DHT dht(DHT_PIN, DHT11);
+Ultrasonic ultrasonic(ULTRASONIC_PIN);
 WonderK210 *wk;
 CRGB g_leds[NUM_RGB_LEDS];
 
@@ -186,7 +217,6 @@ portMUX_TYPE g_servo_timer_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint16_t g_servo1_pulse_ticks;
 volatile uint16_t g_servo2_pulse_ticks;
 #define SERVO_PWM_PERIOD_TICKS (SERVO_PWM_PERIOD_MS * 1000 / SERVO_TIMER_TICK_US)
-
 
 // =================================================================================
 // 区域: HAL (Hardware Abstraction Layer)
@@ -219,10 +249,21 @@ void hal_servo_update_pulse(uint8_t servo_num, uint8_t angle) {
   uint16_t pulse_ticks = pulse_us / SERVO_TIMER_TICK_US;
 
   portENTER_CRITICAL(&g_servo_timer_mux);
-  if (servo_num == 1) g_servo1_pulse_ticks = pulse_ticks;
-  else if (servo_num == 2) g_servo2_pulse_ticks = pulse_ticks;
+  if (servo_num == 1)
+    g_servo1_pulse_ticks = pulse_ticks;
+  else if (servo_num == 2)
+    g_servo2_pulse_ticks = pulse_ticks;
   portEXIT_CRITICAL(&g_servo_timer_mux);
 }
+
+// void hal_line_sensors_init()
+// {
+//   pinMode(LINE_SENSOR_L2_PIN, INPUT);
+//   pinMode(LINE_SENSOR_L1_PIN, INPUT);
+//   pinMode(LINE_SENSOR_R1_PIN, INPUT);
+//   pinMode(LINE_SENSOR_R2_PIN, INPUT);
+//   Serial.println("HAL: Line follower sensors initialized.");
+// }
 
 void hal_servo_init() {
   pinMode(SERVO1_PIN, OUTPUT);
@@ -232,8 +273,8 @@ void hal_servo_init() {
   timerAlarm(g_servo_timer, SERVO_TIMER_TICK_US, true, 0);
 
   // 开机复位舵机到默认角度
-  hal_servo_update_pulse(1, SERVO_DEFAULT_ANGLE);
-  hal_servo_update_pulse(2, SERVO_DEFAULT_ANGLE);
+  hal_servo_update_pulse(1, SERVO1_DEFAULT_ANGLE);
+  hal_servo_update_pulse(2, SERVO2_DEFAULT_ANGLE);
   Serial.println("HAL: Servos initialized and reset to 90 degrees.");
 }
 
@@ -302,13 +343,10 @@ void hal_sensors_init() {
     g_is_accelerometer_available = false;
     Serial.println("HAL WARNING: LIS3DHTR (Accelerometer) not found. Skipping initialization.");
   }
-
   // 温湿度
   dht.begin();
-
   // 光线
-  pinMode(ANALOG2_PIN_A, INPUT);
-
+  pinMode(LIGHT_PIN, INPUT);
   // K210
   Serial1.begin(115200, SERIAL_8N1, K210_RX_PIN, K210_TX_PIN);
   wk = new WonderK210(&Serial1);
@@ -325,10 +363,13 @@ void hal_comms_init() {
 
 void hal_ps2_init() {
   int error = ps2x.config_gamepad(PS2_CLK_PIN, PS2_CMD_PIN, PS2_CS_PIN, PS2_DATA_PIN, true, true);
+
   if (error == 0) {
+    g_is_ps2_connected = true;  // 设置全局标志位为已连接
     Serial.println("HAL: PS2 Controller configured successfully.");
   } else {
-    Serial.printf("HAL ERROR: PS2 Controller configuration failed with code %d\n", error);
+    g_is_ps2_connected = false;  // 设置全局标志位为未连接
+    Serial.printf("HAL WARNING: PS2 Controller not found or failed to configure (error code: %d)\n", error);
   }
 }
 
@@ -336,7 +377,6 @@ void hal_button_init() {
   pinMode(USER_BUTTON_A_PIN, INPUT_PULLUP);
   Serial.println("HAL: User button initialized.");
 }
-
 
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
@@ -351,7 +391,6 @@ class MyServerCallbacks : public BLEServerCallbacks {
     Serial.println("Restarting BLE advertising...");
   }
 };
-
 
 void init_wifi_ap() {
   WiFi.mode(WIFI_AP);
@@ -426,62 +465,83 @@ void vTaskMotorControl(void *pvParameters) {
  */
 void vTaskControl(void *pvParameters) {
   MotorCommand motor_cmd = { 0, 0, 0, 0 };
-  ServoCommand servo_cmd = { SERVO_DEFAULT_ANGLE, SERVO_DEFAULT_ANGLE };
+  ServoCommand servo_cmd = { SERVO1_DEFAULT_ANGLE, SERVO2_DEFAULT_ANGLE };
+
+  // 定义用于安全的停止指令
+  const MotorCommand motor_cmd_stop = { 0, 0, 0, 0 };
+  const ServoCommand servo_cmd_center = { SERVO1_DEFAULT_ANGLE, SERVO2_DEFAULT_ANGLE };
 
   Serial.println("TASK: PS2 Control task started.");
 
   for (;;) {
-    ps2x.read_gamepad(false, false);
+    if (g_is_ps2_connected) {
+      // --- 状态: 已连接 ---
+      // 尝试读取手柄数据，read_gamepad在成功时返回true
+      if (ps2x.read_gamepad(false, false)) {
+        // 读取成功，正常处理控制逻辑
+        int ly = ps2x.Analog(PSS_LY);
+        int lx = ps2x.Analog(PSS_LX);
+        int ry = ps2x.Analog(PSS_RY);
+        int rx = ps2x.Analog(PSS_RX);
 
-    int ly = ps2x.Analog(PSS_LY);  // 左摇杆 Y (127-0:上, 127-255:下)
-    int lx = ps2x.Analog(PSS_LX);  // 左摇杆 X (128-0:左, 128-255:右)
-    int ry = ps2x.Analog(PSS_RY);  // 右摇杆 Y
-    int rx = ps2x.Analog(PSS_RX);  // 右摇杆 X
+        int move_speed = 0;
+        int strafe_speed = 0;
+        int rotate_speed = 0;
 
-    // --- 电机控制逻辑 ---
-    int move_speed = 0;
-    int strafe_speed = 0;
-    int rotate_speed = 0;
+        if (abs(ly - 128) > 15)
+          move_speed = map(ly, 0, 255, 255, -255);
+        if (abs(lx - 128) > 15)
+          strafe_speed = map(lx, 0, 255, -255, 255);
+        if (ps2x.Button(PSB_L1))
+          rotate_speed = 200;
+        if (ps2x.Button(PSB_R1))
+          rotate_speed = -200;
 
-    // 阈值判断，避免摇杆漂移
-    if (abs(ly - 128) > 15) move_speed = map(ly, 0, 255, 255, -255);
-    if (abs(lx - 128) > 15) strafe_speed = map(lx, 0, 255, -255, 255);
+        if (rotate_speed != 0) {
+          motor_cmd.lf_speed = rotate_speed;
+          motor_cmd.rf_speed = -rotate_speed;
+          motor_cmd.lr_speed = rotate_speed;
+          motor_cmd.rr_speed = -rotate_speed;
+        } else {
+          motor_cmd.lf_speed = move_speed + strafe_speed;
+          motor_cmd.rf_speed = move_speed - strafe_speed;
+          motor_cmd.lr_speed = move_speed - strafe_speed;
+          motor_cmd.rr_speed = move_speed + strafe_speed;
+        }
 
-    if (ps2x.Button(PSB_L1)) rotate_speed = -200;   // 顺时针
-    if (ps2x.Button(PSB_R1)) rotate_speed = 200;  // 逆时针
+        xQueueSend(g_motor_cmd_queue, &motor_cmd, 0);
 
-    if (rotate_speed != 0) {
-      motor_cmd.lf_speed = rotate_speed;
-      motor_cmd.rf_speed = -rotate_speed;
-      motor_cmd.lr_speed = rotate_speed;
-      motor_cmd.rr_speed = -rotate_speed;
+        if (abs(ry - 128) > 15 || abs(rx - 128) > 15) {
+          servo_cmd.servo1_angle = map(ry, 0, 255, 180, 0);
+          servo_cmd.servo2_angle = map(rx, 0, 255, 0, 180);
+          xQueueSend(g_servo_cmd_queue, &servo_cmd, 0);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));  // 正常控制循环延时
+      } else {
+        // 读取失败，判定为手柄已断开
+        Serial.println("ERROR: PS2 Controller disconnected during runtime!");
+        g_is_ps2_connected = false;  // 更新状态标志
+        // **安全关键**: 立即发送停止指令
+        xQueueSend(g_motor_cmd_queue, &motor_cmd_stop, 0);
+        xQueueSend(g_servo_cmd_queue, &servo_cmd_center, 0);
+      }
     } else {
-      // 麦克纳姆轮速度混合
-      motor_cmd.lf_speed = move_speed + strafe_speed;
-      motor_cmd.rf_speed = move_speed - strafe_speed;
-      motor_cmd.lr_speed = move_speed - strafe_speed;
-      motor_cmd.rr_speed = move_speed + strafe_speed;
+      // --- 状态: 未连接 ---
+      Serial.println("PS2 Control Task: Controller not connected. Attempting to reconnect...");
+      // 尝试重新配置手柄
+      if (ps2x.config_gamepad(PS2_CLK_PIN, PS2_CMD_PIN, PS2_CS_PIN, PS2_DATA_PIN, true, true) == 0) {
+        g_is_ps2_connected = true;  // 如果成功，更新状态
+        Serial.println("PS2 Controller reconnected successfully!");
+      }
+      // 无论成功与否，都等待一段时间再重试，避免CPU占用过高
+      vTaskDelay(pdMS_TO_TICKS(2000));
     }
-
-    // 发送到电机队列
-    xQueueSend(g_motor_cmd_queue, &motor_cmd, pdMS_TO_TICKS(10));
-
-    // --- 舵机控制逻辑 ---
-    if (abs(ry - 128) > 15 || abs(rx - 128) > 15) {
-      servo_cmd.servo1_angle = map(ry, 0, 255, 180, 0);  // 右摇杆Y控制舵机1
-      servo_cmd.servo2_angle = map(rx, 0, 255, 0, 180);  // 右摇杆X控制舵机2
-
-      // 发送到舵机队列
-      xQueueSend(g_servo_cmd_queue, &servo_cmd, pdMS_TO_TICKS(10));
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(50));  // 每50ms读取一次手柄
   }
 }
 
-
 /**
- * @brief (新) 传感器数据采集任务
+ * @brief 传感器数据采集任务
  * - 严格按照固定周期采集所有传感器数据
  * - 将采集到的数据打包后发送到 g_sensor_data_queue 队列
  * - 此任务不负责任何形式的数据输出或打印
@@ -512,7 +572,7 @@ void vTaskSensorCollection(void *pvParameters) {
     }
 
     data_packet.ultrasonic_dist = ultrasonic.MeasureInCentimeters();
-    data_packet.light_level = analogRead(ANALOG2_PIN_A);
+    data_packet.light_level = analogRead(LIGHT_PIN);
 
     wk->update_data();
     if (wk->recive_box(&face_result_buffer, K210_FIND_FACE_YOLO)) {
@@ -532,7 +592,7 @@ void vTaskSensorCollection(void *pvParameters) {
   }
 }
 /**
- * @brief (新) 数据上报任务
+ * @brief 数据上报任务
  * - 阻塞等待 g_sensor_data_queue 队列中的新数据
  * - 收到数据后，将其格式化并通过串口打印到PC
  * - 任务的执行频率由数据的到达决定
@@ -548,7 +608,7 @@ void vTaskDataReporting(void *pvParameters) {
     if (xQueueReceive(g_sensor_data_queue, &received_packet, portMAX_DELAY) == pdPASS) {
 
       // --- 数据上报到串口 ---
-      Serial.printf("--- Sensor Data @ %lu ms ---\n", millis());  // 增加时间戳
+      Serial.printf("--- Sensor Data @ %lu ms ---\n", millis());
       Serial.printf("Temp: %.1f C, Humidity: %.1f %%\n", received_packet.temperature, received_packet.humidity);
       if (received_packet.accelerometer_available) {
         Serial.printf("Accel (x,y,z): %.2f, %.2f, %.2f\n", received_packet.acc_x, received_packet.acc_y, received_packet.acc_z);
@@ -569,7 +629,6 @@ void vTaskDataReporting(void *pvParameters) {
     // 注意：此任务中不需要 vTaskDelay()，因为它由 xQueueReceive 自然地管理执行节奏
   }
 }
-
 
 /**
  * @brief 用户交互任务 (UI Task)
@@ -595,7 +654,8 @@ void vTaskUI(void *pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(20));  // 消抖
       if (digitalRead(USER_BUTTON_A_PIN) == LOW) {
         xEventGroupSetBits(g_ui_event_group, EVENT_RGB_BRIGHTNESS_CYCLE);
-        while (digitalRead(USER_BUTTON_A_PIN) == LOW) vTaskDelay(pdMS_TO_TICKS(10));  // 等待按键释放
+        while (digitalRead(USER_BUTTON_A_PIN) == LOW)
+          vTaskDelay(pdMS_TO_TICKS(10));  // 等待按键释放
       }
     }
 
@@ -604,9 +664,11 @@ void vTaskUI(void *pvParameters) {
       String command = Serial2.readStringUntil('\n');
       command.trim();
       if (command.equalsIgnoreCase("RGB:ON")) {
-        if (!rgb_on) xEventGroupSetBits(g_ui_event_group, EVENT_RGB_TOGGLE_ON_OFF);
+        if (!rgb_on)
+          xEventGroupSetBits(g_ui_event_group, EVENT_RGB_TOGGLE_ON_OFF);
       } else if (command.equalsIgnoreCase("RGB:OFF")) {
-        if (rgb_on) xEventGroupSetBits(g_ui_event_group, EVENT_RGB_TOGGLE_ON_OFF);
+        if (rgb_on)
+          xEventGroupSetBits(g_ui_event_group, EVENT_RGB_TOGGLE_ON_OFF);
       }
     }
 
@@ -642,7 +704,6 @@ void vTaskUI(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(20));  // UI任务循环延时
   }
 }
-
 
 // =================================================================================
 // 区域: Main Program
