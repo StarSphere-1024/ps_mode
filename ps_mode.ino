@@ -104,8 +104,8 @@
 #define SERVO_PWM_PERIOD_MS 20         // 20ms 周期
 #define SERVO_MIN_PULSE_US 500
 #define SERVO_MAX_PULSE_US 2500
-#define SERVO1_DEFAULT_ANGLE 110
-#define SERVO2_DEFAULT_ANGLE 90
+#define SERVO1_DEFAULT_ANGLE 180
+#define SERVO2_DEFAULT_ANGLE 85
 
 // -- FreeRTOS 配置 --
 // 任务优先级
@@ -491,9 +491,9 @@ void vTaskControl(void *pvParameters) {
           }
 
           if (ps2x.Button(PSB_L1))
-          rotate_speed = 200;
+          rotate_speed = -200;
         if (ps2x.Button(PSB_R1))
-            rotate_speed = -200;
+            rotate_speed = 200;
 
           if (rotate_speed != 0) {
             motor_cmd.lf_speed = rotate_speed;
@@ -510,7 +510,7 @@ void vTaskControl(void *pvParameters) {
           xQueueSend(g_motor_cmd_queue, &motor_cmd, 0);
 
           if (abs(ry - 128) > 15 || abs(rx - 128) > 15) {
-            servo_cmd.servo1_angle = map(ry, 0, 255, 180, 0);
+            servo_cmd.servo1_angle = map(ry, 0, 255, 180, 100);
             servo_cmd.servo2_angle = map(rx, 0, 255, 0, 180);
             xQueueSend(g_servo_cmd_queue, &servo_cmd, 0);
           }
