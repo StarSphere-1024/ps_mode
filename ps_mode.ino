@@ -35,7 +35,7 @@
 #include <PS2X_lib.h>
 #include <SoftwareSerial.h>
 #include "LIS3DHTR.h"
-#include "Grove_Temperature_And_Humidity_Sensor.h"
+#include "DHT.h"
 #include "Ultrasonic.h"
 #include <WonderK210.h>
 
@@ -73,10 +73,6 @@
 #define DHT_PIN GROVE4_PIN_A
 #define ULTRASONIC_PIN GROVE5_PIN_A
 
-#define LINE_SENSOR_L2_PIN GROVE3_PIN_A  // 最左
-#define LINE_SENSOR_L1_PIN GROVE3_PIN_B  // 内左
-#define LINE_SENSOR_R1_PIN GROVE6_PIN_A  // 内右
-#define LINE_SENSOR_R2_PIN GROVE6_PIN_B  // 最右
 
 // PS2 手柄
 #define PS2_CMD_PIN 9
@@ -108,7 +104,7 @@
 #define SERVO_PWM_PERIOD_MS 20         // 20ms 周期
 #define SERVO_MIN_PULSE_US 500
 #define SERVO_MAX_PULSE_US 2500
-#define SERVO1_DEFAULT_ANGLE 100
+#define SERVO1_DEFAULT_ANGLE 110
 #define SERVO2_DEFAULT_ANGLE 90
 
 // -- FreeRTOS 配置 --
@@ -150,11 +146,6 @@
 // 区域: types.h - 共享数据结构和枚举
 // =================================================================================
 
-// typedef enum
-// {
-//   MODE_MANUAL,        // 手动遥控模式
-//   MODE_LINE_FOLLOWING // 自动循迹模式
-// } CarMode;
 
 // 电机控制指令结构体
 typedef struct
@@ -197,7 +188,6 @@ QueueHandle_t g_servo_cmd_queue;
 QueueHandle_t g_sensor_data_queue;
 EventGroupHandle_t g_ui_event_group;
 
-// volatile CarMode g_car_mode = MODE_MANUAL;
 bool g_is_accelerometer_available = false;
 bool g_is_ps2_connected = false;
 BLECharacteristic *pCharacteristic;
@@ -255,15 +245,6 @@ void hal_servo_update_pulse(uint8_t servo_num, uint8_t angle) {
     g_servo2_pulse_ticks = pulse_ticks;
   portEXIT_CRITICAL(&g_servo_timer_mux);
 }
-
-// void hal_line_sensors_init()
-// {
-//   pinMode(LINE_SENSOR_L2_PIN, INPUT);
-//   pinMode(LINE_SENSOR_L1_PIN, INPUT);
-//   pinMode(LINE_SENSOR_R1_PIN, INPUT);
-//   pinMode(LINE_SENSOR_R2_PIN, INPUT);
-//   Serial.println("HAL: Line follower sensors initialized.");
-// }
 
 void hal_servo_init() {
   pinMode(SERVO1_PIN, OUTPUT);
@@ -478,60 +459,60 @@ void vTaskControl(void *pvParameters) {
       // --- 状态: 已连接 ---
       // 尝试读取手柄数据，read_gamepad在成功时返回true
       if (ps2x.read_gamepad(false, false)) {
-        // 读取成功，正常处理控制逻辑
-        int ly = ps2x.Analog(PSS_LY);
-        int lx = ps2x.Analog(PSS_LX);
-        int ry = ps2x.Analog(PSS_RY);
-        int rx = ps2x.Analog(PSS_RX);
+          // 读取成功，正常处理控制逻辑
+          int ly = ps2x.Analog(PSS_LY);
+          int lx = ps2x.Analog(PSS_LX);
+          int ry = ps2x.Analog(PSS_RY);
+          int rx = ps2x.Analog(PSS_RX);
 
-        int move_speed = 0;
-        int strafe_speed = 0;
-        int rotate_speed = 0;
+          int move_speed = 0;
+          int strafe_speed = 0;
+          int rotate_speed = 0;
 
-        if (abs(ly - 128) > 15)
-          move_speed = map(ly, 0, 255, 255, -255);
-        if (abs(lx - 128) > 15)
-          strafe_speed = map(lx, 0, 255, -255, 255);
+          if (abs(ly - 128) > 15)
+            move_speed = map(ly, 0, 255, 255, -255);
+          if (abs(lx - 128) > 15)
+            strafe_speed = map(lx, 0, 255, -255, 255);
 
-        // 如果模拟摇杆在死区内，则检查D-Pad（方向键）的输入
-        if (move_speed == 0 && strafe_speed == 0) {
-          if (ps2x.Button(PSB_PAD_UP)) {
-            move_speed = dpad_speed;  // 前进
-          } else if (ps2x.Button(PSB_PAD_DOWN)) {
-            move_speed = -dpad_speed;  // 后退
+          // 如果模拟摇杆在死区内，则检查D-Pad（方向键）的输入
+          if (move_speed == 0 && strafe_speed == 0) {
+            if (ps2x.Button(PSB_PAD_UP)) {
+              move_speed = dpad_speed;  // 前进
+            } else if (ps2x.Button(PSB_PAD_DOWN)) {
+              move_speed = -dpad_speed;  // 后退
+            }
+
+            if (ps2x.Button(PSB_PAD_LEFT)) {
+              strafe_speed = -dpad_speed;  // 左平移
+            } else if (ps2x.Button(PSB_PAD_RIGHT)) {
+              strafe_speed = dpad_speed;  // 右平移
+            }
           }
 
-          if (ps2x.Button(PSB_PAD_LEFT)) {
-            strafe_speed = -dpad_speed;  // 左平移
-          } else if (ps2x.Button(PSB_PAD_RIGHT)) {
-            strafe_speed = dpad_speed;  // 右平移
-          }
-        }
-
-        if (ps2x.Button(PSB_L1))
+          if (ps2x.Button(PSB_L1))
           rotate_speed = 200;
         if (ps2x.Button(PSB_R1))
-          rotate_speed = -200;
+            rotate_speed = -200;
 
-        if (rotate_speed != 0) {
-          motor_cmd.lf_speed = rotate_speed;
-          motor_cmd.rf_speed = -rotate_speed;
-          motor_cmd.lr_speed = rotate_speed;
-          motor_cmd.rr_speed = -rotate_speed;
-        } else {
-          motor_cmd.lf_speed = move_speed + strafe_speed;
-          motor_cmd.rf_speed = move_speed - strafe_speed;
-          motor_cmd.lr_speed = move_speed - strafe_speed;
-          motor_cmd.rr_speed = move_speed + strafe_speed;
-        }
+          if (rotate_speed != 0) {
+            motor_cmd.lf_speed = rotate_speed;
+            motor_cmd.rf_speed = -rotate_speed;
+            motor_cmd.lr_speed = rotate_speed;
+            motor_cmd.rr_speed = -rotate_speed;
+          } else {
+            motor_cmd.lf_speed = move_speed + strafe_speed;
+            motor_cmd.rf_speed = move_speed - strafe_speed;
+            motor_cmd.lr_speed = move_speed - strafe_speed;
+            motor_cmd.rr_speed = move_speed + strafe_speed;
+          }
 
-        xQueueSend(g_motor_cmd_queue, &motor_cmd, 0);
+          xQueueSend(g_motor_cmd_queue, &motor_cmd, 0);
 
-        if (abs(ry - 128) > 15 || abs(rx - 128) > 15) {
-          servo_cmd.servo1_angle = map(ry, 0, 255, 180, 0);
-          servo_cmd.servo2_angle = map(rx, 0, 255, 0, 180);
-          xQueueSend(g_servo_cmd_queue, &servo_cmd, 0);
-        }
+          if (abs(ry - 128) > 15 || abs(rx - 128) > 15) {
+            servo_cmd.servo1_angle = map(ry, 0, 255, 180, 0);
+            servo_cmd.servo2_angle = map(rx, 0, 255, 0, 180);
+            xQueueSend(g_servo_cmd_queue, &servo_cmd, 0);
+          }
 
         vTaskDelay(pdMS_TO_TICKS(50));  // 正常控制循环延时
       } else {
@@ -571,10 +552,8 @@ void vTaskSensorCollection(void *pvParameters) {
   for (;;) {
     // --- 数据采集逻辑 ---
     float temp_hum_val[2] = { 0 };
-    if (!dht.readTempAndHumidity(temp_hum_val)) {
-      data_packet.humidity = temp_hum_val[0];
-      data_packet.temperature = temp_hum_val[1];
-    }
+    data_packet.humidity = dht.readHumidity();
+    data_packet.temperature = dht.readTemperature();
 
     data_packet.accelerometer_available = g_is_accelerometer_available;
     if (g_is_accelerometer_available) {
@@ -643,7 +622,7 @@ void vTaskDataReporting(void *pvParameters) {
       Serial.printf("-------------------------------\n\n");
     }
     // 注意：此任务中不需要 vTaskDelay()，因为它由 xQueueReceive 自然地管理执行节奏
-  }
+    }
 }
 
 /**
@@ -713,7 +692,7 @@ void vTaskUI(void *pvParameters) {
 
     // --- 3. 更新RGB状态 (流动光效) ---
     if (rgb_on) {
-      fill_rainbow(g_leds, NUM_RGB_LEDS, hue++, 7);
+          fill_rainbow(g_leds, NUM_RGB_LEDS, hue++, 7);
       FastLED.show();
     }
 
