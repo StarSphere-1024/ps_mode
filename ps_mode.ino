@@ -468,6 +468,7 @@ void vTaskControl(void *pvParameters) {
           int move_speed = 0;
           int strafe_speed = 0;
           int rotate_speed = 0;
+          const int dpad_speed = 180;
 
           if (abs(ly - 128) > 15)
             move_speed = map(ly, 0, 255, 255, -255);
