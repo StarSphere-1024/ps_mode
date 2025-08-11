@@ -39,13 +39,23 @@
 #include "Ultrasonic.h"
 #include <WonderK210.h>
 
-// =================================================================================
-// 区域: config.h - 全局配置
-// =================================================================================
+
+// 开关1: 全局日志开关
+// 设置为 1 来开启所有 LOG_D(...) 宏的串口打印功能。
+// 设置为 0 来在最终发布时禁用所有日志，不产生任何代码，提高性能。
+#define ENABLE_LOGGING 1
+#define DEBUG_MODE_ACTIVE 1
+
+#if ENABLE_LOGGING
+#define LOG_D(format, ...) Serial.printf("[%lu][D][%s:%d] " format "\n", millis(), __FUNCTION__, __LINE__, ##__VA_ARGS__)
+#else
+#define LOG_D(format, ...)
+#endif
 
 // -- 引脚定义 --
 // 用户按键
 #define USER_BUTTON_A_PIN 21
+#define USER_BUTTON_B_PIN 0
 // RGB 灯带
 #define RGB_PIN 33
 // I2C 总线
@@ -73,6 +83,16 @@
 #define DHT_PIN GROVE4_PIN_A
 #define ULTRASONIC_PIN GROVE5_PIN_A
 
+// 俯视小车，从左到右
+#define LINE_SENSOR_L2_PIN GROVE3_PIN_A  // 最左
+#define LINE_SENSOR_L1_PIN GROVE3_PIN_B  // 内左
+#define LINE_SENSOR_R1_PIN GROVE6_PIN_A  // 内右
+#define LINE_SENSOR_R2_PIN GROVE6_PIN_B  // 最右
+
+#define ANALOG_MAX_VALUE 4095.0f
+
+#define LINE_FOLLOW_BASE_SPEED 130  // 循迹时的基础前进速度
+#define LINE_THRESHOLD 1500
 
 // PS2 手柄
 #define PS2_CMD_PIN 9
@@ -80,14 +100,14 @@
 #define PS2_CLK_PIN 41
 #define PS2_CS_PIN 42
 // 电机驱动 (硬件PWM)
-#define LF_MOTOR_FWD_PWM 11
-#define LF_MOTOR_REV_PWM 12
-#define RF_MOTOR_FWD_PWM 14
-#define RF_MOTOR_REV_PWM 13
-#define LR_MOTOR_FWD_PWM 15
-#define LR_MOTOR_REV_PWM 16
-#define RR_MOTOR_FWD_PWM 18
-#define RR_MOTOR_REV_PWM 17
+#define LF_MOTOR_FWD_PWM 12
+#define LF_MOTOR_REV_PWM 11
+#define RF_MOTOR_FWD_PWM 13
+#define RF_MOTOR_REV_PWM 14
+#define LR_MOTOR_FWD_PWM 16
+#define LR_MOTOR_REV_PWM 15
+#define RR_MOTOR_FWD_PWM 17
+#define RR_MOTOR_REV_PWM 18
 // 舵机 (软件PWM)
 #define SERVO1_PIN 48
 #define SERVO2_PIN 47
@@ -120,7 +140,7 @@
 #define TASK_LINE_FOLLOWING_STACK_SIZE 4096
 #define TASK_SENSOR_COLLECTION_STACK_SIZE 4096
 #define TASK_DATA_REPORTING_STACK_SIZE 4096
-#define TASK_CONTROL_STACK_SIZE 8192
+#define TASK_CONTROL_STACK_SIZE 4096
 #define TASK_MOTOR_STACK_SIZE 4096
 #define TASK_UI_STACK_SIZE 4096
 // 队列大小
@@ -142,10 +162,10 @@
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-// =================================================================================
-// 区域: types.h - 共享数据结构和枚举
-// =================================================================================
-
+typedef enum {
+  MODE_MANUAL,         // 手动遥控模式
+  MODE_LINE_FOLLOWING  // 自动循迹模式
+} CarMode;
 
 // 电机控制指令结构体
 typedef struct
@@ -178,6 +198,15 @@ typedef struct
   bool face_detected;
 } SensorDataPacket;
 
+typedef enum {
+  LINE_STATE_LOST,       // 完全脱离轨道
+  LINE_STATE_CENTERED,   // 在中心
+  LINE_STATE_LEFT,       // 轻微向左偏
+  LINE_STATE_RIGHT,      // 轻微向右偏
+  LINE_STATE_FAR_LEFT,   // 严重向左偏
+  LINE_STATE_FAR_RIGHT,  // 严重向右偏
+  LINE_STATE_JUNCTION    // 可能在交叉点 (所有传感器都在线上)
+} LineFollowerState_e;
 // =================================================================================
 // 区域: 全局变量与对象
 // =================================================================================
@@ -188,10 +217,18 @@ QueueHandle_t g_servo_cmd_queue;
 QueueHandle_t g_sensor_data_queue;
 EventGroupHandle_t g_ui_event_group;
 
+volatile CarMode g_current_car_mode = MODE_MANUAL;
+volatile LineFollowerState_e g_line_follower_state = LINE_STATE_LOST;
+const MotorCommand g_motor_cmd_stop = { 0, 0, 0, 0 };
+bool g_start_button_released = true;
 bool g_is_accelerometer_available = false;
 bool g_is_ps2_connected = false;
 BLECharacteristic *pCharacteristic;
 bool g_device_connected = false;
+
+float g_kp = 0.15;
+float g_ki = 0.0002;
+float g_kd = 0.1;
 
 // -- 硬件对象 --
 PS2X ps2x;
@@ -246,6 +283,14 @@ void hal_servo_update_pulse(uint8_t servo_num, uint8_t angle) {
   portEXIT_CRITICAL(&g_servo_timer_mux);
 }
 
+void hal_line_sensors_init() {
+  pinMode(LINE_SENSOR_L2_PIN, INPUT);
+  pinMode(LINE_SENSOR_L1_PIN, INPUT);
+  pinMode(LINE_SENSOR_R1_PIN, INPUT);
+  pinMode(LINE_SENSOR_R2_PIN, INPUT);
+  Serial.println("HAL: Line follower sensors initialized.");
+}
+
 void hal_servo_init() {
   pinMode(SERVO1_PIN, OUTPUT);
   pinMode(SERVO2_PIN, OUTPUT);
@@ -275,10 +320,10 @@ void hal_motor_set_speed(uint8_t fwd_pin, uint8_t rev_pin, int16_t speed) {
 }
 
 void hal_motor_write_command(const MotorCommand cmd) {
-  hal_motor_set_speed(LF_MOTOR_FWD_PWM, LF_MOTOR_REV_PWM, -cmd.lf_speed);
-  hal_motor_set_speed(RF_MOTOR_FWD_PWM, RF_MOTOR_REV_PWM, -cmd.rf_speed);
-  hal_motor_set_speed(LR_MOTOR_FWD_PWM, LR_MOTOR_REV_PWM, -cmd.lr_speed);
-  hal_motor_set_speed(RR_MOTOR_FWD_PWM, RR_MOTOR_REV_PWM, -cmd.rr_speed);
+  hal_motor_set_speed(LF_MOTOR_FWD_PWM, LF_MOTOR_REV_PWM, cmd.lf_speed);
+  hal_motor_set_speed(RF_MOTOR_FWD_PWM, RF_MOTOR_REV_PWM, cmd.rf_speed);
+  hal_motor_set_speed(LR_MOTOR_FWD_PWM, LR_MOTOR_REV_PWM, cmd.lr_speed);
+  hal_motor_set_speed(RR_MOTOR_FWD_PWM, RR_MOTOR_REV_PWM, cmd.rr_speed);
 }
 
 void hal_motor_init() {
@@ -356,6 +401,7 @@ void hal_ps2_init() {
 
 void hal_button_init() {
   pinMode(USER_BUTTON_A_PIN, INPUT_PULLUP);
+  pinMode(USER_BUTTON_B_PIN, INPUT_PULLUP);
   Serial.println("HAL: User button initialized.");
 }
 
@@ -449,7 +495,6 @@ void vTaskControl(void *pvParameters) {
   ServoCommand servo_cmd = { SERVO1_DEFAULT_ANGLE, SERVO2_DEFAULT_ANGLE };
 
   // 定义用于安全的停止指令
-  const MotorCommand motor_cmd_stop = { 0, 0, 0, 0 };
   const ServoCommand servo_cmd_center = { SERVO1_DEFAULT_ANGLE, SERVO2_DEFAULT_ANGLE };
 
   Serial.println("TASK: PS2 Control task started.");
@@ -459,6 +504,25 @@ void vTaskControl(void *pvParameters) {
       // --- 状态: 已连接 ---
       // 尝试读取手柄数据，read_gamepad在成功时返回true
       if (ps2x.read_gamepad(false, false)) {
+
+        if (ps2x.Button(PSB_START) && g_start_button_released) {
+          g_start_button_released = false;  // 按键已按下，防止连续触发
+          if (g_current_car_mode == MODE_MANUAL) {
+            g_current_car_mode = MODE_LINE_FOLLOWING;
+            // 进入循迹模式时，立即发送停止指令，避免车辆冲出
+            xQueueSend(g_motor_cmd_queue, &g_motor_cmd_stop, 0);
+            Serial.println("MODE: Switched to Line Following.");
+          } else {
+            g_current_car_mode = MODE_MANUAL;
+            // 切换回手动模式，同样先停车
+            xQueueSend(g_motor_cmd_queue, &g_motor_cmd_stop, 0);
+            Serial.println("MODE: Switched to Manual Control.");
+          }
+        }
+        if (!ps2x.Button(PSB_START)) {
+          g_start_button_released = true;
+        }
+        if (g_current_car_mode == MODE_MANUAL) {
           // 读取成功，正常处理控制逻辑
           int ly = ps2x.Analog(PSS_LY);
           int lx = ps2x.Analog(PSS_LX);
@@ -491,9 +555,9 @@ void vTaskControl(void *pvParameters) {
           }
 
           if (ps2x.Button(PSB_L1))
-          rotate_speed = -200;
-        if (ps2x.Button(PSB_R1))
-            rotate_speed = 200;
+            rotate_speed = -170;
+          if (ps2x.Button(PSB_R1))
+            rotate_speed = 170;
 
           if (rotate_speed != 0) {
             motor_cmd.lf_speed = rotate_speed;
@@ -507,6 +571,7 @@ void vTaskControl(void *pvParameters) {
             motor_cmd.rr_speed = move_speed + strafe_speed;
           }
 
+
           xQueueSend(g_motor_cmd_queue, &motor_cmd, 0);
 
           if (abs(ry - 128) > 15 || abs(rx - 128) > 15) {
@@ -514,14 +579,14 @@ void vTaskControl(void *pvParameters) {
             servo_cmd.servo2_angle = map(rx, 0, 255, 0, 180);
             xQueueSend(g_servo_cmd_queue, &servo_cmd, 0);
           }
-
+        }
         vTaskDelay(pdMS_TO_TICKS(50));  // 正常控制循环延时
       } else {
         // 读取失败，判定为手柄已断开
         Serial.println("ERROR: PS2 Controller disconnected during runtime!");
         g_is_ps2_connected = false;  // 更新状态标志
         // **安全关键**: 立即发送停止指令
-        xQueueSend(g_motor_cmd_queue, &motor_cmd_stop, 0);
+        xQueueSend(g_motor_cmd_queue, &g_motor_cmd_stop, 0);
         xQueueSend(g_servo_cmd_queue, &servo_cmd_center, 0);
       }
     } else {
@@ -599,10 +664,9 @@ void vTaskDataReporting(void *pvParameters) {
   Serial.println("TASK: Data Reporting task started.");
 
   for (;;) {
-    // --- 从队列接收数据 ---
-    // portMAX_DELAY 会使任务一直阻塞，直到队列中有数据可读，非常高效
-    if (xQueueReceive(g_sensor_data_queue, &received_packet, portMAX_DELAY) == pdPASS) {
 
+    if (xQueueReceive(g_sensor_data_queue, &received_packet, portMAX_DELAY) == pdPASS) {
+#if !DEBUG_MODE_ACTIVE
       // --- 数据上报到串口 ---
       Serial.printf("--- Sensor Data @ %lu ms ---\n", millis());
       Serial.printf("Temp: %.1f C, Humidity: %.1f %%\n", received_packet.temperature, received_packet.humidity);
@@ -621,9 +685,122 @@ void vTaskDataReporting(void *pvParameters) {
         Serial.println("Face: Not Detected");
       }
       Serial.printf("-------------------------------\n\n");
+#endif
     }
-    // 注意：此任务中不需要 vTaskDelay()，因为它由 xQueueReceive 自然地管理执行节奏
+  }
+}
+
+/**
+ * @brief 新增: 自动循迹任务 (PID版本)
+ * - 仅在循迹模式下运行
+ * - 读取四个传感器的模拟值来计算加权平均位置 (error)
+ * - 使用PID控制器计算电机修正量
+ * - 实现更平滑、更精确的循迹控制
+ */
+void vTaskLineFollowing(void *pvParameters) {
+  MotorCommand motor_cmd;
+  const MotorCommand g_motor_cmd_stop = { 0, 0, 0, 0 };
+  float error = 0.0f, last_error = 0.0f, integral = 0.0f, derivative = 0.0f, correction = 0.0f;
+  const float sensor_weights[] = { -3.0f, -1.0f, 1.0f, 3.0f };
+  static unsigned long last_log_time = 0;
+  const unsigned long LOG_INTERVAL_MS = 250;
+
+  for (;;) {
+    if (g_current_car_mode == MODE_LINE_FOLLOWING) {
+
+      uint16_t sensor_values[] = {
+        analogRead(LINE_SENSOR_L2_PIN), analogRead(LINE_SENSOR_L1_PIN),
+        analogRead(LINE_SENSOR_R1_PIN), analogRead(LINE_SENSOR_R2_PIN)
+      };
+
+      uint8_t s_l2_dig = (sensor_values[0] > LINE_THRESHOLD) ? 0 : 1;
+      uint8_t s_l1_dig = (sensor_values[1] > LINE_THRESHOLD) ? 0 : 1;
+      uint8_t s_r1_dig = (sensor_values[2] > LINE_THRESHOLD) ? 0 : 1;
+      uint8_t s_r2_dig = (sensor_values[3] > LINE_THRESHOLD) ? 0 : 1;
+      uint8_t digital_state = (s_r2_dig << 3) | (s_r1_dig << 2) | (s_l1_dig << 1) | s_l2_dig;
+
+
+      if (digital_state == 0b0000 || digital_state == 0b1111) {
+        g_line_follower_state = LINE_STATE_LOST;
+      } else {
+        switch (digital_state) {
+          case 0b1001:
+            g_line_follower_state = LINE_STATE_CENTERED;
+            break;
+          case 0b1101:
+            g_line_follower_state = LINE_STATE_RIGHT;
+            break;
+          case 0b1110:
+            g_line_follower_state = LINE_STATE_FAR_RIGHT;
+            break;
+          case 0b0011:
+            g_line_follower_state = LINE_STATE_LEFT;
+            break;
+          case 0b0111:
+            g_line_follower_state = LINE_STATE_FAR_LEFT;
+            break;
+          case 0b0001:
+          case 0b1000:
+            g_line_follower_state = LINE_STATE_JUNCTION;
+            break;
+          default:
+            g_line_follower_state = LINE_STATE_LOST;
+            break;
+        }
+      }
+      // 安全保护：如果脱轨，则停车并跳过PID计算
+      if (g_line_follower_state == LINE_STATE_LOST) {
+        xQueueSend(g_motor_cmd_queue, &g_motor_cmd_stop, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));  // 短暂延时后重新检测
+        continue;                       // 直接开始下一次循环
+      }
+
+      float weighted_sum = 0.0f;
+      float total_sum = 0.0f;
+      for (int i = 0; i < 4; i++) {
+        if (sensor_values[i] > LINE_THRESHOLD) {
+          weighted_sum += (float)sensor_values[i] * sensor_weights[i];
+          total_sum += (float)sensor_values[i];
+        }
+      }
+
+      if (total_sum > 0) {
+        error = weighted_sum / total_sum;
+      } else {
+        error = 0;
+      }
+
+      // 5. PID控制器计算修正量
+      integral += error;
+      integral = constrain(integral, -200, 200);  // 积分抗饱和
+
+      derivative = error - last_error;
+
+      correction = (g_kp * error) + (g_ki * integral) + (g_kd * derivative);
+
+      last_error = error;
+
+      int left_speed = constrain(LINE_FOLLOW_BASE_SPEED + correction, -255, 255);
+      int right_speed = constrain(LINE_FOLLOW_BASE_SPEED - correction, -255, 255);
+
+      motor_cmd = { left_speed, right_speed, left_speed, right_speed };
+      xQueueSend(g_motor_cmd_queue, &motor_cmd, 0);
+
+      if (millis() - last_log_time >= LOG_INTERVAL_MS) {
+        last_log_time = millis();  // 更新上次打印的时间戳
+        LOG_D("Raw Sensor (L2,L1,R1,R2): %4u, %4u, %4u, %4u", sensor_values[0], sensor_values[1], sensor_values[2], sensor_values[3]);
+        LOG_D("Calculated Digital State: 0b%d%d%d%d (Hex: 0x%X)", s_r2_dig, s_r1_dig, s_l1_dig, s_l2_dig, digital_state);
+        LOG_D("Resolved to State: %d", g_line_follower_state);
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(10));
+    } else {
+      // 当不处于循迹模式时，重置所有PID状态变量，并设置UI状态为丢失
+      error = last_error = integral = derivative = 0.0f;
+      g_line_follower_state = LINE_STATE_LOST;
+      vTaskDelay(pdMS_TO_TICKS(100));
     }
+  }
 }
 
 /**
@@ -654,6 +831,53 @@ void vTaskUI(void *pvParameters) {
           vTaskDelay(pdMS_TO_TICKS(10));  // 等待按键释放
       }
     }
+
+    if (digitalRead(USER_BUTTON_B_PIN) == LOW) {
+      vTaskDelay(pdMS_TO_TICKS(20));  // 消抖
+      if (digitalRead(USER_BUTTON_B_PIN) == LOW) {
+        // 切换模式
+        if (g_current_car_mode == MODE_MANUAL) {
+          g_current_car_mode = MODE_LINE_FOLLOWING;
+          LOG_D("MODE: Switched to Line Following (via Button B)");
+        } else {
+          g_current_car_mode = MODE_MANUAL;
+          LOG_D("MODE: Switched to Manual Control (via Button B)");
+        }
+        // 安全关键步骤: 每次切换模式时，都发送停止指令以防止车辆冲出
+        xQueueSend(g_motor_cmd_queue, &g_motor_cmd_stop, 0);
+        // 等待按键释放，防止一次长按导致模式快速来回切换
+        while (digitalRead(USER_BUTTON_B_PIN) == LOW) {
+          vTaskDelay(pdMS_TO_TICKS(10));
+        }
+      }
+    }
+
+    if (Serial.available() > 0) {
+            String input = Serial.readStringUntil('\n');
+            input.trim();
+            if (input.length() > 1) {
+                char command = tolower(input.charAt(0));
+                float value = input.substring(1).toFloat();
+                
+                switch(command) {
+                    case 'p':
+                        g_kp = value;
+                        LOG_D("PID Update: Kp set to %.4f", g_kp);
+                        break;
+                    case 'i':
+                        g_ki = value;
+                        LOG_D("PID Update: Ki set to %.4f", g_ki);
+                        break;
+                    case 'd':
+                        g_kd = value;
+                        LOG_D("PID Update: Kd set to %.4f", g_kd);
+                        break;
+                    default:
+                        LOG_D("Unknown command: %s", input.c_str());
+                        break;
+                }
+            }
+        }
 
     // 检查语音模块串口
     if (Serial2.available() > 0) {
@@ -691,11 +915,46 @@ void vTaskUI(void *pvParameters) {
       Serial.printf("UI Event: Brightness cycled to %d\n", new_brightness);
     }
 
-    // --- 3. 更新RGB状态 (流动光效) ---
+    // --- 3. 更新RGB状态 (根据小车模式进行选择) ---
     if (rgb_on) {
+      switch (g_current_car_mode) {
+        case MODE_MANUAL:
+          // 手动模式下，显示默认流动光效
           fill_rainbow(g_leds, NUM_RGB_LEDS, hue++, 7);
-      FastLED.show();
+          break;
+
+        case MODE_LINE_FOLLOWING:
+          // 循迹模式下，根据传感器状态显示固定颜色
+          switch (g_line_follower_state) {
+            case LINE_STATE_CENTERED:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Green);  // 居中: 绿色
+              break;
+            case LINE_STATE_LEFT:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Cyan);  // 左偏: 青色
+              break;
+            case LINE_STATE_RIGHT:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Magenta);  // 右偏: 品红
+              break;
+            case LINE_STATE_FAR_LEFT:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Blue);  // 严重左偏: 蓝色
+              break;
+            case LINE_STATE_FAR_RIGHT:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Red);  // 严重右偏: 红色
+              break;
+            case LINE_STATE_JUNCTION:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Orange);  // 交叉点: 橙色
+              break;
+            case LINE_STATE_LOST:
+            default:
+              fill_solid(g_leds, NUM_RGB_LEDS, CRGB::White);  // 丢失: 白色
+              break;
+          }
+          break;
+      }
+    } else {  // 如果RGB总开关是关的
+      fill_solid(g_leds, NUM_RGB_LEDS, CRGB::Black);
     }
+    FastLED.show();
 
     vTaskDelay(pdMS_TO_TICKS(20));  // UI任务循环延时
   }
@@ -723,6 +982,7 @@ void setup() {
   hal_comms_init();
   hal_ps2_init();
   hal_button_init();
+  hal_line_sensors_init();
 
   // ----  创建FreeRTOS通信机制 ----
   g_motor_cmd_queue = xQueueCreate(MOTOR_CMD_QUEUE_LEN, sizeof(MotorCommand));
@@ -779,6 +1039,15 @@ void setup() {
     TASK_UI_STACK_SIZE,
     NULL,
     TASK_UI_PRIO,
+    NULL,
+    1);
+
+  xTaskCreatePinnedToCore(
+    vTaskLineFollowing,
+    "LineFollowTask",
+    TASK_LINE_FOLLOWING_STACK_SIZE,
+    NULL,
+    TASK_LINE_FOLLOWING_PRIO,
     NULL,
     1);
 

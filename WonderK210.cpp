@@ -37,7 +37,6 @@ WonderK210::WonderK210(HardwareSerial *serial, unsigned long baudrate) : _serial
     pk_ctl.index_head = 0;
     pk_ctl.index_tail = 0;
     read_succeed = false;
-    Serial.println("WonderK210 serial initialized");
 }
 
 // 更新解析函数
